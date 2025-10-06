@@ -134,6 +134,11 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if err != nil {
 		// unable to find a Machine for the NodeClaim, this could be due to timeout or error, but the replica count needs to be reset.
 		// TODO (elmiko) this could probably use improvement to make it more resilient to errors.
+		machineDeployment, err = c.machineDeploymentProvider.Get(ctx, selectedInstanceType.MachineDeploymentName, selectedInstanceType.MachineDeploymentNamespace)
+		if err != nil {
+			return nil, fmt.Errorf("cannot satisfy create, error while recovering from failure to find an unclaimed Machine, unable to find MachineDeployment %q for InstanceType %q: %w", selectedInstanceType.MachineDeploymentName, selectedInstanceType.Name, err)
+		}
+
 		machineDeployment.Spec.Replicas = ptr.To(originalReplicas)
 		if err := c.machineDeploymentProvider.Update(ctx, machineDeployment); err != nil {
 			return nil, fmt.Errorf("cannot satisfy create, error while recovering from failure to find an unclaimed Machine: %w", err)
