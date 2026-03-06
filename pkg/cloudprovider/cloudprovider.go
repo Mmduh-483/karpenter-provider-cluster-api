@@ -30,9 +30,11 @@ import (
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 	capiv1beta1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -58,7 +60,15 @@ const (
 	taintsKey       = "capacity.cluster-autoscaler.kubernetes.io/taints"
 	maxPodsKey      = "capacity.cluster-autoscaler.kubernetes.io/maxPods"
 
-	machineAnnotation = "cluster.x-k8s.io/machine"
+	machineAnnotation           = "cluster.x-k8s.io/machine"
+	machineDeploymentAnnotation = "cluster.x-k8s.io/machine-deployment"
+
+	// pendingProviderIDPrefix is used as a synthetic ProviderID when a Machine has been claimed
+	// by karpenter but its real ProviderID has not yet been assigned by the infrastructure provider.
+	// It encodes the Machine namespace/name so that Delete and Get can locate the Machine.
+	// Without a non-empty ProviderID, karpenter's finalize() skips calling our Delete, so the
+	// MachineDeployment replica count would never be decremented on NodeClaim termination.
+	pendingProviderIDPrefix = "capi-pending://"
 )
 
 func NewCloudProvider(ctx context.Context, kubeClient client.Client, machineProvider machine.Provider, machineDeploymentProvider machinedeployment.Provider) *CloudProvider {
@@ -97,13 +107,19 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		return nil, err
 	}
 
-	if machine.Spec.ProviderID == nil {
-		return nil, fmt.Errorf("cannot satisfy create, waiting for Machine %q to have ProviderID", machine.Name)
-	}
-
 	//  fill out nodeclaim with details
 	createdNodeClaim := createNodeClaimFromMachineDeployment(machineDeployment)
-	createdNodeClaim.Status.ProviderID = *machine.Spec.ProviderID
+	if machine.Spec.ProviderID != nil && *machine.Spec.ProviderID != "" {
+		createdNodeClaim.Status.ProviderID = *machine.Spec.ProviderID
+	} else {
+		// Machine is claimed but the infrastructure provider hasn't assigned a ProviderID yet.
+		// Return a synthetic ProviderID so karpenter marks this NodeClaim as "launched".
+		// Without a non-empty ProviderID, karpenter's finalize() skips calling our Delete when
+		// the NodeClaim is terminated, leaving the MachineDeployment replica count permanently
+		// elevated (the root cause of the replica escalation bug).
+		// The real ProviderID will replace this once the infrastructure provisions the Machine.
+		createdNodeClaim.Status.ProviderID = fmt.Sprintf("%s%s/%s", pendingProviderIDPrefix, machine.Namespace, machine.Name)
+	}
 
 	return createdNodeClaim, nil
 }
@@ -118,9 +134,31 @@ func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 
 	// find machine
 	if len(nodeClaim.Status.ProviderID) != 0 {
-		machine, err = c.machineProvider.GetByProviderID(ctx, nodeClaim.Status.ProviderID)
-		if err != nil {
-			return fmt.Errorf("error finding Machine with provider ID %q to Delete NodeClaim %q: %w", nodeClaim.Status.ProviderID, nodeClaim.Name, err)
+		if strings.HasPrefix(nodeClaim.Status.ProviderID, pendingProviderIDPrefix) {
+			// NodeClaim was launched with a synthetic ProviderID before the Machine received its
+			// real one. Extract the Machine namespace/name encoded in the synthetic ProviderID.
+			ref := strings.TrimPrefix(nodeClaim.Status.ProviderID, pendingProviderIDPrefix)
+			machineNamespace, machineName, parseErr := parseMachineAnnotation(ref)
+			if parseErr != nil {
+				return fmt.Errorf("error parsing pending provider ID %q for NodeClaim %q: %w", nodeClaim.Status.ProviderID, nodeClaim.Name, parseErr)
+			}
+			machine, err = c.machineProvider.Get(ctx, machineName, machineNamespace)
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					if mdAnno, ok := nodeClaim.Annotations[machineDeploymentAnnotation]; ok {
+						if mdNamespace, mdName, parseErr := parseMachineAnnotation(mdAnno); parseErr == nil {
+							c.tryDecrementMachineDeploymentReplicas(ctx, mdNamespace, mdName)
+						}
+					}
+					return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("Machine %q in namespace %q no longer exists for NodeClaim %q", machineName, machineNamespace, nodeClaim.Name))
+				}
+				return fmt.Errorf("error finding Machine %q to Delete NodeClaim %q: %w", machineName, nodeClaim.Name, err)
+			}
+		} else {
+			machine, err = c.machineProvider.GetByProviderID(ctx, nodeClaim.Status.ProviderID)
+			if err != nil {
+				return fmt.Errorf("error finding Machine with provider ID %q to Delete NodeClaim %q: %w", nodeClaim.Status.ProviderID, nodeClaim.Name, err)
+			}
 		}
 	} else if machineAnno, ok := nodeClaim.Annotations[machineAnnotation]; ok {
 		machineNamespace, machineName, err := parseMachineAnnotation(machineAnno)
@@ -130,6 +168,17 @@ func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 
 		machine, err = c.machineProvider.Get(ctx, machineName, machineNamespace)
 		if err != nil {
+			if apierrors.IsNotFound(err) {
+				// Machine is already gone. Decrement the MD replicas using the MD annotation so
+				// the replica count stays accurate, then signal to karpenter that the NodeClaim
+				// is no longer backed by a real machine.
+				if mdAnno, ok := nodeClaim.Annotations[machineDeploymentAnnotation]; ok {
+					if mdNamespace, mdName, parseErr := parseMachineAnnotation(mdAnno); parseErr == nil {
+						c.tryDecrementMachineDeploymentReplicas(ctx, mdNamespace, mdName)
+					}
+				}
+				return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("Machine %q in namespace %q no longer exists for NodeClaim %q", machineName, machineNamespace, nodeClaim.Name))
+			}
 			return fmt.Errorf("error finding Machine %q in namespace %s to Delete NodeClaim %q: %w", machineName, machineNamespace, nodeClaim.Name, err)
 		}
 	} else {
@@ -137,49 +186,71 @@ func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	}
 
 	if machine == nil {
+		// Machine was not found by ProviderID. This happens when the infrastructure provider
+		// assigned a real ProviderID to the Machine (replacing our synthetic capi-pending:// one),
+		// and then the Machine was later deleted (e.g. due to a provisioning failure with no
+		// available servers). The replica count was incremented when the Machine was first
+		// provisioned and must be decremented now; otherwise every retry by Karpenter will
+		// increment from the already-elevated value, causing unbounded replica escalation.
+		if mdAnno, ok := nodeClaim.Annotations[machineDeploymentAnnotation]; ok {
+			if mdNamespace, mdName, parseErr := parseMachineAnnotation(mdAnno); parseErr == nil {
+				c.tryDecrementMachineDeploymentReplicas(ctx, mdNamespace, mdName)
+			}
+		}
 		return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("unable to find Machine with provider ID %q to Delete NodeClaim %q", nodeClaim.Status.ProviderID, nodeClaim.Name))
 	}
 
 	// check if already deleting
 	if c.machineProvider.IsDeleting(machine) {
-		// Machine is already deleting, we do not need to annotate it or change the scalable resource replicas.
-		return nil
-	}
-
-	// check if reducing replicas goes below zero
-	machineDeployment, err := c.machineDeploymentFromMachine(ctx, machine)
-	if err != nil {
-		return fmt.Errorf("unable to delete NodeClaim %q, cannot find an owner MachineDeployment for Machine %q: %w", nodeClaim.Name, machine.Name, err)
-	}
-
-	if machineDeployment.Spec.Replicas == nil {
-		return fmt.Errorf("unable to delete NodeClaim %q, MachineDeployment %q has nil replicas", nodeClaim.Name, machineDeployment.Name)
-	}
-
-	if *machineDeployment.Spec.Replicas == 0 {
-		return fmt.Errorf("unable to delete NodeClaim %q, MachineDeployment %q is already at zero replicas", nodeClaim.Name, machineDeployment.Name)
+		// Machine is already being deleted — either by a previous Delete call that added the
+		// delete annotation, or by an external CAPI scale-down.
+		//
+		// In both cases the replica decrement has already happened:
+		//   - karpenter-initiated: we decremented in the first Delete call (not-IsDeleting path below).
+		//   - CAPI-initiated scale-down: CAPI decremented MD.Spec.Replicas before picking the Machine.
+		//
+		// Do NOT decrement again. Return NodeClaimNotFoundError to tell karpenter's EnsureTerminated
+		// that this NodeClaim is fully handled, so it removes the finalizer immediately (no requeue).
+		return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("Machine %q for NodeClaim %q is already being deleted", machine.Name, nodeClaim.Name))
 	}
 
 	// mark the machine for deletion before decrementing replicas to protect against the wrong machine being removed
-	err = c.machineProvider.AddDeleteAnnotation(ctx, machine)
-	if err != nil {
+	if err := c.machineProvider.AddDeleteAnnotation(ctx, machine); err != nil {
 		return fmt.Errorf("unable to delete NodeClaim %q, cannot annotate Machine %q for deletion: %w", nodeClaim.Name, machine.Name, err)
 	}
 
-	//   and reduce machinedeployment replicas
-	updatedReplicas := *machineDeployment.Spec.Replicas - 1
-	machineDeployment.Spec.Replicas = ptr.To(updatedReplicas)
-	err = c.machineDeploymentProvider.Update(ctx, machineDeployment)
-	if err != nil {
-		// cleanup the machine delete annotation so we don't affect future replica changes
-		if err := c.machineProvider.RemoveDeleteAnnotation(ctx, machine); err != nil {
-			return fmt.Errorf("unable to delete NodeClaim %q, cannot remove delete annotation for Machine %q during cleanup: %w", nodeClaim.Name, machine.Name, err)
+	// Decrement MachineDeployment replicas with RetryOnConflict so that a stale cached
+	// ResourceVersion (409 Conflict) does not permanently prevent the decrement.
+	if retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		machineDeployment, err := c.machineDeploymentFromMachine(ctx, machine)
+		if err != nil {
+			return fmt.Errorf("cannot find owner MachineDeployment for Machine %q: %w", machine.Name, err)
 		}
-
-		return fmt.Errorf("unable to delete NodeClaim %q, cannot update MachineDeployment %q replicas: %w", nodeClaim.Name, machineDeployment.Name, err)
+		if machineDeployment.Spec.Replicas == nil {
+			return fmt.Errorf("MachineDeployment %q has nil replicas", machineDeployment.Name)
+		}
+		if *machineDeployment.Spec.Replicas == 0 {
+			return fmt.Errorf("MachineDeployment %q is already at zero replicas", machineDeployment.Name)
+		}
+		machineDeployment.Spec.Replicas = ptr.To(*machineDeployment.Spec.Replicas - 1)
+		return c.machineDeploymentProvider.Update(ctx, machineDeployment)
+	}); retryErr != nil {
+		// Cleanup the machine delete annotation so we don't affect future replica changes.
+		if removeErr := c.machineProvider.RemoveDeleteAnnotation(ctx, machine); removeErr != nil {
+			return fmt.Errorf("unable to delete NodeClaim %q, cannot remove delete annotation for Machine %q during cleanup: %w", nodeClaim.Name, machine.Name, removeErr)
+		}
+		return fmt.Errorf("unable to delete NodeClaim %q, cannot update MachineDeployment replicas: %w", nodeClaim.Name, retryErr)
 	}
 
-	return nil
+	// Return NodeClaimNotFoundError to signal to karpenter's EnsureTerminated that this NodeClaim
+	// is fully handled. This causes it to return isTerminated=true, so finalize() removes the
+	// NodeClaim finalizer immediately without requeueing.
+	//
+	// Returning nil here would cause a 5-second requeue. On that requeue, the Machine would
+	// appear as IsDeleting (because we just added the annotation above), and the IsDeleting path
+	// would be entered again — which could race with a new NodeClaim's Create incrementing replicas,
+	// leading to a second (erroneous) decrement and replica escalation.
+	return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("Machine %q for NodeClaim %q has been marked for deletion", machine.Name, nodeClaim.Name))
 }
 
 // Get returns a NodeClaim for the Machine object with the supplied provider ID, or nil if not found.
@@ -188,12 +259,31 @@ func (c *CloudProvider) Get(ctx context.Context, providerID string) (*karpv1.Nod
 		return nil, fmt.Errorf("no providerID supplied to Get, cannot continue")
 	}
 
-	machine, err := c.machineProvider.GetByProviderID(ctx, providerID)
-	if err != nil {
-		return nil, fmt.Errorf("error getting Machine: %w", err)
-	}
-	if machine == nil {
-		return nil, cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("cannot find Machine with provider ID %q", providerID))
+	var machine *capiv1beta1.Machine
+	var err error
+
+	if strings.HasPrefix(providerID, pendingProviderIDPrefix) {
+		// Synthetic ProviderID: look up Machine directly by namespace/name.
+		ref := strings.TrimPrefix(providerID, pendingProviderIDPrefix)
+		machineNamespace, machineName, parseErr := parseMachineAnnotation(ref)
+		if parseErr != nil {
+			return nil, fmt.Errorf("error parsing pending provider ID %q: %w", providerID, parseErr)
+		}
+		machine, err = c.machineProvider.Get(ctx, machineName, machineNamespace)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("cannot find Machine %q/%q", machineNamespace, machineName))
+			}
+			return nil, fmt.Errorf("error getting Machine: %w", err)
+		}
+	} else {
+		machine, err = c.machineProvider.GetByProviderID(ctx, providerID)
+		if err != nil {
+			return nil, fmt.Errorf("error getting Machine: %w", err)
+		}
+		if machine == nil {
+			return nil, cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("cannot find Machine with provider ID %q", providerID))
+		}
 	}
 
 	nodeClaim, err := c.machineToNodeClaim(ctx, machine)
@@ -296,6 +386,17 @@ func (c *CloudProvider) provisionMachine(ctx context.Context, nodeClaim *karpv1.
 
 	machine, err := c.machineProvider.Get(ctx, machineName, machineNamespace)
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// The Machine no longer exists. The previous createMachine call already incremented
+			// the MachineDeployment replicas for a Machine that is now gone. Decrement that
+			// phantom replica before starting a fresh provisioning attempt to prevent escalation.
+			if mdAnno, ok := nodeClaim.Annotations[machineDeploymentAnnotation]; ok {
+				if mdNamespace, mdName, parseErr := parseMachineAnnotation(mdAnno); parseErr == nil {
+					c.tryDecrementMachineDeploymentReplicas(ctx, mdNamespace, mdName)
+				}
+			}
+			return c.createMachine(ctx, nodeClaim)
+		}
 		return nil, nil, fmt.Errorf("failed to get NodeClaim's Machine %s : %w", machineName, err)
 	}
 
@@ -337,10 +438,45 @@ func (c *CloudProvider) createMachine(ctx context.Context, nodeClaim *karpv1.Nod
 	if err != nil {
 		return nil, nil, fmt.Errorf("cannot satisfy create, unable to find MachineDeployment %q for InstanceType %q: %w", selectedInstanceType.MachineDeploymentName, selectedInstanceType.Name, err)
 	}
+
+	rollbackCtx := context.WithoutCancel(ctx)
+
+	// Before incrementing replicas, check if a prior failed attempt already allocated an
+	// unclaimed Machine for this MachineDeployment. Reusing it avoids inflating the replica
+	// count on each retry cycle, which is the root cause of replica escalation.
+	// Important: if an existing Machine is found but claiming it fails, we must return an error
+	// rather than fall through to the increment path — incrementing when MD is already elevated
+	// by a phantom replica would over-count replicas by one.
+	if existingMachine := c.findUnclaimedMachineForMachineDeployment(ctx, machineDeployment); existingMachine != nil {
+		return c.claimMachine(ctx, rollbackCtx, machineDeployment, existingMachine, nodeClaim)
+	}
+
 	originalReplicas := *machineDeployment.Spec.Replicas
 	machineDeployment.Spec.Replicas = ptr.To(originalReplicas + 1)
 	if err := c.machineDeploymentProvider.Update(ctx, machineDeployment); err != nil {
 		return nil, nil, fmt.Errorf("cannot satisfy create, unable to update MachineDeployment %q replicas: %w", machineDeployment.Name, err)
+	}
+
+	// rollbackReplicas resets the MachineDeployment replica count to originalReplicas.
+	// context.WithoutCancel preserves tracing/logging values from ctx while detaching its cancellation,
+	// so the rollback succeeds even if the outer ctx has already expired.
+	// We use machineDeployment directly on the first attempt since it already carries the fresh
+	// ResourceVersion from the successful increment update, avoiding a stale informer cache read.
+	// Only on conflict do we re-fetch to get the latest ResourceVersion before retrying.
+	rollbackReplicas := func() {
+		md := machineDeployment
+		if retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			md.Spec.Replicas = ptr.To(originalReplicas)
+			if err := c.machineDeploymentProvider.Update(rollbackCtx, md); err != nil {
+				if latest, getErr := c.machineDeploymentProvider.Get(rollbackCtx, selectedInstanceType.MachineDeploymentName, selectedInstanceType.MachineDeploymentNamespace); getErr == nil {
+					md = latest
+				}
+				return err
+			}
+			return nil
+		}); retryErr != nil {
+			log.Println(fmt.Errorf("error while recovering replicas for MachineDeployment %q for InstanceType %q: %w", selectedInstanceType.MachineDeploymentName, selectedInstanceType.Name, retryErr))
+		}
 	}
 
 	// TODO (elmiko) it would be nice to have a more elegant solution to the asynchronous machine creation.
@@ -352,40 +488,100 @@ func (c *CloudProvider) createMachine(ctx context.Context, nodeClaim *karpv1.Nod
 	machine, err := c.pollForUnclaimedMachineInMachineDeploymentWithTimeout(ctx, machineDeployment, time.Minute)
 	if err != nil {
 		// unable to find a Machine for the NodeClaim, this could be due to timeout or error, but the replica count needs to be reset.
-		// TODO (elmiko) this could probably use improvement to make it more resilient to errors.
-		defer func() {
-			machineDeployment, err = c.machineDeploymentProvider.Get(ctx, selectedInstanceType.MachineDeploymentName, selectedInstanceType.MachineDeploymentNamespace)
-			if err != nil {
-				log.Println(fmt.Errorf("error while recovering from failure to find an unclaimed Machine, unable to find MachineDeployment %q for InstanceType %q: %w", selectedInstanceType.MachineDeploymentName, selectedInstanceType.Name, err))
-			}
-
-			machineDeployment.Spec.Replicas = ptr.To(originalReplicas)
-			if err = c.machineDeploymentProvider.Update(ctx, machineDeployment); err != nil {
-				log.Println(fmt.Errorf("error while recovering from failure to find an unclaimed Machine: %w", err))
-			}
-		}()
-
+		rollbackReplicas()
 		return nil, nil, fmt.Errorf("cannot satisfy create, unable to find an unclaimed Machine for MachineDeployment %q: %w", machineDeployment.Name, err)
 	}
 
-	// now that we have a Machine for the NodeClaim, we label it as a karpenter member
+	md, m, claimErr := c.claimMachine(ctx, rollbackCtx, machineDeployment, machine, nodeClaim)
+	if claimErr != nil {
+		rollbackReplicas()
+		return nil, nil, claimErr
+	}
+
+	return md, m, nil
+}
+
+// findUnclaimedMachineForMachineDeployment returns the first non-deleting Machine in the
+// MachineDeployment that has not yet been claimed by karpenter, or nil if none exist.
+func (c *CloudProvider) findUnclaimedMachineForMachineDeployment(ctx context.Context, machineDeployment *capiv1beta1.MachineDeployment) *capiv1beta1.Machine {
+	selector := &metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{
+			{
+				Key:      providers.NodePoolMemberLabel,
+				Operator: metav1.LabelSelectorOpDoesNotExist,
+			},
+			{
+				Key:      capiv1beta1.MachineDeploymentNameLabel,
+				Operator: metav1.LabelSelectorOpIn,
+				Values:   []string{machineDeployment.Name},
+			},
+		},
+	}
+	machineList, err := c.machineProvider.List(ctx, selector)
+	if err != nil {
+		return nil
+	}
+	for _, m := range machineList {
+		if m.GetDeletionTimestamp().IsZero() {
+			return m
+		}
+	}
+	return nil
+}
+
+// claimMachine labels machine as a karpenter member and binds it to nodeClaim via annotations.
+// rollbackCtx is used for cleanup operations that must survive cancellation of ctx.
+func (c *CloudProvider) claimMachine(ctx, rollbackCtx context.Context, machineDeployment *capiv1beta1.MachineDeployment, machine *capiv1beta1.Machine, nodeClaim *karpv1.NodeClaim) (*capiv1beta1.MachineDeployment, *capiv1beta1.Machine, error) {
 	labels := machine.GetLabels()
 	labels[providers.NodePoolMemberLabel] = ""
 	machine.SetLabels(labels)
 	if err := c.machineProvider.Update(ctx, machine); err != nil {
-		// if we can't update the Machine with the member label, we need to unwind the addition
-		// TODO (elmiko) add more logic here to fix the error, if we are in this state it's not clear how to fix,
-		// since we have a Machine, we should be reducing the replicas and annotating the Machine for deletion.
 		return nil, nil, fmt.Errorf("cannot satisfy create, unable to label Machine %q as a member: %w", machine.Name, err)
 	}
 
-	// Bind the NodeClaim with this machine.
+	// Bind the NodeClaim with this machine and its owning MachineDeployment.
+	// The MD annotation is used to decrement replicas if the Machine disappears before
+	// the NodeClaim is deleted, preventing replica escalation on re-provision.
 	nodeClaim.Annotations[machineAnnotation] = fmt.Sprintf("%s/%s", machine.Namespace, machine.Name)
-	if err = c.kubeClient.Update(ctx, nodeClaim); err != nil {
+	nodeClaim.Annotations[machineDeploymentAnnotation] = fmt.Sprintf("%s/%s", machineDeployment.Namespace, machineDeployment.Name)
+	if err := c.kubeClient.Update(ctx, nodeClaim); err != nil {
+		// The Machine was already labeled as a member; remove that label before rolling back replicas
+		// so future polls can still find unclaimed Machines correctly.
+		// RetryOnConflict handles potential 409 Conflicts from a stale cached ResourceVersion.
+		if unlabelErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			m, getErr := c.machineProvider.Get(rollbackCtx, machine.Name, machine.Namespace)
+			if getErr != nil {
+				return getErr
+			}
+			delete(m.Labels, providers.NodePoolMemberLabel)
+			return c.machineProvider.Update(rollbackCtx, m)
+		}); unlabelErr != nil {
+			log.Println(fmt.Errorf("cannot satisfy create, unable to remove member label from Machine %q during cleanup: %w", machine.Name, unlabelErr))
+		}
 		return nil, nil, fmt.Errorf("cannot satisfy create, unable to update NodeClaim annotations %q: %w", nodeClaim.Name, err)
 	}
 
 	return machineDeployment, machine, nil
+}
+
+// tryDecrementMachineDeploymentReplicas decrements the replica count of the named MachineDeployment
+// by one. It is a best-effort operation: errors are logged but not returned, because it is used in
+// cleanup paths where the caller cannot meaningfully handle a failure.
+func (c *CloudProvider) tryDecrementMachineDeploymentReplicas(ctx context.Context, mdNamespace, mdName string) {
+	cleanupCtx := context.WithoutCancel(ctx)
+	if retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		md, err := c.machineDeploymentProvider.Get(cleanupCtx, mdName, mdNamespace)
+		if err != nil {
+			return err
+		}
+		if md.Spec.Replicas != nil && *md.Spec.Replicas > 0 {
+			md.Spec.Replicas = ptr.To(*md.Spec.Replicas - 1)
+			return c.machineDeploymentProvider.Update(cleanupCtx, md)
+		}
+		return nil
+	}); retryErr != nil {
+		log.Println(fmt.Errorf("error decrementing replicas for MachineDeployment %q/%q: %w", mdNamespace, mdName, retryErr))
+	}
 }
 
 func (c *CloudProvider) machineDeploymentFromMachine(ctx context.Context, machine *capiv1beta1.Machine) (*capiv1beta1.MachineDeployment, error) {
@@ -487,12 +683,16 @@ func (c *CloudProvider) pollForUnclaimedMachineInMachineDeploymentWithTimeout(ct
 			// this might need to ignore the error for the sake of the timeout
 			return false, fmt.Errorf("error listing unclaimed Machines for MachineDeployment %q: %w", machineDeployment.Name, err)
 		}
-		if len(machineList) == 0 {
-			return false, nil
+		for _, m := range machineList {
+			// Skip Machines that are already being deleted; claiming one would bind the NodeClaim
+			// to a Machine that will never become a Node, and the subsequent Delete call would
+			// not reduce the replica count (IsDeleting guard), leaving MD permanently elevated.
+			if m.GetDeletionTimestamp().IsZero() {
+				machine = m
+				return true, nil
+			}
 		}
-
-		machine = machineList[0]
-		return true, nil
+		return false, nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error polling for an unclaimed Machine in MachineDeployment %q: %w", machineDeployment.Name, err)
